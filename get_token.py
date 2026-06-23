@@ -8,7 +8,7 @@ import urllib.request
 import webbrowser
 
 CLIENT_ID = "3MVG9nSH73I5aFNi1._.oYzqFFlQX7QCSbG7NKSXbytZQQ3gE9A.XzpOme5Luew3GXmNc9fbhZdVLGq_JyN7g"
-CLIENT_SECRET = "YOUR_CLIENT_SECRET_HERE"
+CLIENT_SECRET = os.environ.get("SALESFORCE_CLIENT_SECRET", "YOUR_CLIENT_SECRET_HERE")
 REDIRECT_URI = "https://login.salesforce.com/services/oauth2/success"
 AUTH_URL = "https://login.salesforce.com/services/oauth2/authorize"
 TOKEN_URL = "https://login.salesforce.com/services/oauth2/token"
@@ -28,7 +28,7 @@ params = urllib.parse.urlencode({
     "response_type": "code",
     "client_id": CLIENT_ID,
     "redirect_uri": REDIRECT_URI,
-    "scope": "mcp_api refresh_token offline_access",
+    "scope": "mcp_api api refresh_token offline_access",
     "code_challenge": code_challenge,
     "code_challenge_method": "S256",
 })
@@ -49,6 +49,12 @@ if not auth_code:
     print("\nNo 'code' found in the URL. Make sure you copied the full URL after approving.")
     raise SystemExit(1)
 
+if CLIENT_SECRET == "YOUR_CLIENT_SECRET_HERE":
+    print("\nERROR: CLIENT_SECRET is still the placeholder.")
+    print("Set it via:  export SALESFORCE_CLIENT_SECRET=your_real_secret")
+    print("Then re-run this script.")
+    raise SystemExit(1)
+
 # Step 2: Exchange code for tokens
 data = urllib.parse.urlencode({
     "grant_type": "authorization_code",
@@ -63,7 +69,13 @@ req = urllib.request.Request(TOKEN_URL, data=data)
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
-response = urllib.request.urlopen(req, context=ctx)
+try:
+    response = urllib.request.urlopen(req, context=ctx)
+except urllib.error.HTTPError as exc:
+    body = exc.read().decode()
+    print(f"\nERROR {exc.code}: {exc.reason}")
+    print("Salesforce says:", body)
+    raise SystemExit(1)
 tokens = json.loads(response.read())
 
 print("\n✅ SUCCESS! Your tokens:")

@@ -186,8 +186,9 @@ async def mcp_post(request: Request) -> Response:
 
     # Store Salesforce session ID so subsequent POSTs include it
     if new_sf_session_id and session_data is not None:
-        session_data["sf_session_id"] = new_sf_session_id
-        logger.info("SF session stored %s → %s", proxy_session_id, new_sf_session_id)
+        if session_data["sf_session_id"] != new_sf_session_id:
+            session_data["sf_session_id"] = new_sf_session_id
+            logger.info("SF session stored %s → %s", proxy_session_id, new_sf_session_id)
 
     # Parse Salesforce response (JSON or SSE)
     response_items: list[dict] = []
