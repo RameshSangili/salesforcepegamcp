@@ -141,16 +141,26 @@ async def mcp_post(request: Request) -> Response:
 @app.get("/mcp")
 async def mcp_get(request: Request) -> Response:
     """
-    Pega 25.1.2 opens a GET /mcp SSE channel before making any POST requests.
-    Salesforce doesn't support GET on their MCP endpoint (returns 405), so the
-    proxy handles it directly with a keepalive SSE stream. Pega holds this open
-    while POST requests flow normally.
+    MCP HTTP+SSE transport handshake (required by Pega 25.1.2).
+    Pega connects via GET and waits for an 'endpoint' event before it sends
+    any POST requests. We emit that event immediately then keep the channel
+    alive with periodic SSE comments.
     """
     if not _check_pega_auth(request):
         return Response(status_code=401, content=b"Unauthorized")
 
-    async def sse_keepalive() -> AsyncIterator[bytes]:
+    # Build the POST endpoint URL from the incoming request headers
+    proto = request.headers.get("x-forwarded-proto", "https")
+    host = request.headers.get("host", "")
+    endpoint_url = f"{proto}://{host}/mcp"
+
+    logger.info("SSE channel opened by Pega, sending endpoint event: %s", endpoint_url)
+
+    async def sse_stream() -> AsyncIterator[bytes]:
         try:
+            # MCP HTTP+SSE spec: tell the client where to POST
+            yield f"event: endpoint\ndata: {endpoint_url}\n\n".encode()
+            # Hold the channel open with keepalive comments
             while True:
                 yield b": keepalive\n\n"
                 await asyncio.sleep(15)
@@ -158,7 +168,7 @@ async def mcp_get(request: Request) -> Response:
             pass
 
     return StreamingResponse(
-        sse_keepalive(),
+        sse_stream(),
         status_code=200,
         headers={
             "Cache-Control": "no-cache",
