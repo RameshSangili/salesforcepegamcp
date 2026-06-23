@@ -136,9 +136,15 @@ async def mcp_post(request: Request) -> Response:
     if not _check_pega_auth(request):
         return Response(status_code=401, content=b"Unauthorized")
 
-    # Identify session from URL query param set in our endpoint event
+    # Identify session from URL query param set in our endpoint event.
+    # Pega 25.1.2 ignores the ?sessionId= and always POSTs to the base /mcp URL,
+    # so fall back to the most recently opened SSE session when no param is present.
     proxy_session_id = request.query_params.get("sessionId")
     session_data = _sessions.get(proxy_session_id) if proxy_session_id else None
+    if session_data is None and _sessions:
+        latest_key = next(reversed(_sessions))
+        session_data = _sessions[latest_key]
+        logger.info("No sessionId in POST — routing to latest SSE session %s", latest_key)
     sf_session_id = session_data["sf_session_id"] if session_data else None
 
     sf_token = await _token_manager.get_access_token()
