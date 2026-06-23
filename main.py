@@ -38,6 +38,66 @@ _token_manager: TokenManager
 # proxy_session_id -> {"queue": asyncio.Queue, "sf_session_id": str | None}
 _sessions: dict[str, dict] = {}
 
+# tool_name -> {camelCaseParam: original-kebab-param}
+# Built from tools/list so we can reverse-map in tools/call.
+_param_map: dict[str, dict[str, str]] = {}
+
+
+def _kebab_to_camel(name: str) -> str:
+    parts = name.split("-")
+    return parts[0] + "".join(p.capitalize() for p in parts[1:])
+
+
+def _transform_tools_list(response: dict) -> dict:
+    """
+    Pega cannot handle hyphenated JSON property names (treats '-' as minus).
+    Rename kebab-case param names → camelCase in the tools/list schema so
+    Pega creates valid intent parameters. Store the reverse mapping so we
+    can convert back when forwarding tools/call to Salesforce.
+    """
+    tools = response.get("result", {}).get("tools", [])
+    for tool in tools:
+        tool_name = tool.get("name", "")
+        schema = tool.get("inputSchema", {})
+        props = schema.get("properties", {})
+        if not any("-" in k for k in props):
+            continue
+        new_props: dict = {}
+        _param_map[tool_name] = {}
+        for k, v in props.items():
+            new_k = _kebab_to_camel(k) if "-" in k else k
+            if new_k != k:
+                _param_map[tool_name][new_k] = k
+            new_props[new_k] = v
+        schema["properties"] = new_props
+        if "required" in schema:
+            schema["required"] = [
+                _kebab_to_camel(r) if "-" in r else r for r in schema["required"]
+            ]
+        logger.info("Remapped params for tool %s: %s", tool_name, _param_map.get(tool_name))
+    return response
+
+
+def _transform_tools_call(body: bytes) -> bytes:
+    """
+    Reverse the camelCase rename done in _transform_tools_list so Salesforce
+    receives the original kebab-case parameter names it expects.
+    """
+    try:
+        req = json.loads(body)
+    except json.JSONDecodeError:
+        return body
+    if req.get("method") != "tools/call":
+        return body
+    tool_name = req.get("params", {}).get("name", "")
+    mapping = _param_map.get(tool_name)
+    if not mapping:
+        return body
+    args = req.get("params", {}).get("arguments", {})
+    req["params"]["arguments"] = {mapping.get(k, k): v for k, v in args.items()}
+    logger.info("Translated tools/call args for %s: %s", tool_name, req["params"]["arguments"])
+    return json.dumps(req).encode()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -160,8 +220,18 @@ async def mcp_post(request: Request) -> Response:
     req_headers = _upstream_headers(request, sf_token, sf_session_id)
     body = await request.body()
 
+    # Detect JSON-RPC method for response-side transforms
+    try:
+        rpc_method = json.loads(body).get("method", "")
+    except (json.JSONDecodeError, AttributeError):
+        rpc_method = ""
+
+    # Reverse camelCase→kebab rename before forwarding tools/call to Salesforce
+    body = _transform_tools_call(body)
+
     logger.info(
-        "Proxying POST /mcp (proxy_session=%s sf_session=%s)",
+        "Proxying POST /mcp method=%s (proxy_session=%s sf_session=%s)",
+        rpc_method or "-",
         proxy_session_id or "-",
         sf_session_id or "-",
     )
@@ -224,6 +294,11 @@ async def mcp_post(request: Request) -> Response:
             "Salesforce responded %d (content-type=%s items=%d)",
             sf_resp.status_code, sf_content_type, len(response_items),
         )
+
+    # Rename kebab-case param names to camelCase in tools/list so Pega
+    # can create valid intent parameters (hyphens break Pega's reference syntax)
+    if rpc_method == "tools/list":
+        response_items = [_transform_tools_list(item) for item in response_items]
 
     # HTTP+SSE transport: push response into SSE stream, return 202 to Pega
     if session_data is not None:
