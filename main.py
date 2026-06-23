@@ -63,10 +63,19 @@ def _upstream_headers(
         k: v
         for k, v in request.headers.items()
         if k.lower() not in _HOP_BY_HOP
-        and k.lower() not in ("authorization", "accept", "mcp-session-id")
+        and k.lower() not in (
+            "authorization", "accept", "mcp-session-id",
+            "content-type", "salesforce-org-domain",
+        )
     }
     headers["Authorization"] = f"Bearer {sf_token}"
+    headers["Content-Type"] = "application/json"
     headers["Accept"] = "application/json, text/event-stream"
+    # Required by api.salesforce.com global gateway to route to the correct org,
+    # especially for write operations (create/update/delete).
+    if _token_manager.instance_url:
+        org_domain = _token_manager.instance_url.replace("https://", "").rstrip("/")
+        headers["Salesforce-Org-Domain"] = org_domain
     if sf_session_id:
         headers["Mcp-Session-Id"] = sf_session_id
     return headers
@@ -203,10 +212,17 @@ async def mcp_post(request: Request) -> Response:
         await sf_resp.aclose()
         await client.aclose()
 
-    logger.info(
-        "Salesforce responded %d (content-type=%s items=%d)",
-        sf_resp.status_code, sf_content_type, len(response_items),
-    )
+    if sf_resp.status_code >= 400:
+        logger.error(
+            "Salesforce error %d (content-type=%s) body=%s",
+            sf_resp.status_code, sf_content_type,
+            json.dumps(response_items) if response_items else "<empty>",
+        )
+    else:
+        logger.info(
+            "Salesforce responded %d (content-type=%s items=%d)",
+            sf_resp.status_code, sf_content_type, len(response_items),
+        )
 
     # HTTP+SSE transport: push response into SSE stream, return 202 to Pega
     if session_data is not None:
