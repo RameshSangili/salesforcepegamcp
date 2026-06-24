@@ -80,8 +80,12 @@ def _transform_tools_list(response: dict) -> dict:
 
 def _transform_tools_call(body: bytes) -> bytes:
     """
-    Reverse the camelCase rename done in _transform_tools_list so Salesforce
-    receives the original kebab-case parameter names it expects.
+    Two transforms before forwarding tools/call to Salesforce:
+    1. Reverse camelCase→kebab rename (undoes what _transform_tools_list did).
+    2. Flatten 'body' argument: Salesforce MCP server expects record fields as
+       direct top-level arguments alongside 'sobject-name', not nested under a
+       'body' key (it treats every argument except 'sobject-name' as a record
+       field, so {'body': {'Email': 'x'}} would try to set a 'body' column).
     """
     try:
         req = json.loads(body)
@@ -90,12 +94,19 @@ def _transform_tools_call(body: bytes) -> bytes:
     if req.get("method") != "tools/call":
         return body
     tool_name = req.get("params", {}).get("name", "")
-    mapping = _param_map.get(tool_name)
-    if not mapping:
-        return body
-    args = req.get("params", {}).get("arguments", {})
-    req["params"]["arguments"] = {mapping.get(k, k): v for k, v in args.items()}
-    logger.info("Translated tools/call args for %s: %s", tool_name, req["params"]["arguments"])
+    mapping = _param_map.get(tool_name, {})
+    args: dict = req.get("params", {}).get("arguments", {})
+
+    # Step 1: reverse camelCase → original kebab-case
+    args = {mapping.get(k, k): v for k, v in args.items()}
+
+    # Step 2: flatten nested 'body' dict into top-level arguments
+    if "body" in args and isinstance(args["body"], dict):
+        body_fields = args.pop("body")
+        args.update(body_fields)
+
+    req["params"]["arguments"] = args
+    logger.info("Translated tools/call args for %s: %s", tool_name, args)
     return json.dumps(req).encode()
 
 
