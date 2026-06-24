@@ -93,9 +93,12 @@ def _transform_tools_call(body: bytes) -> bytes:
         return body
     if req.get("method") != "tools/call":
         return body
-    tool_name = req.get("params", {}).get("name", "")
+    params = req.get("params") or {}
+    tool_name = params.get("name", "")
     mapping = _param_map.get(tool_name, {})
-    args: dict = req.get("params", {}).get("arguments", {})
+    # MCP spec uses "arguments"; some clients use "input"
+    args_key = "arguments" if "arguments" in params else "input"
+    args: dict = params.get(args_key) or {}
 
     # Step 1: reverse camelCase → original kebab-case
     args = {mapping.get(k, k): v for k, v in args.items()}
@@ -105,8 +108,8 @@ def _transform_tools_call(body: bytes) -> bytes:
         body_fields = args.pop("body")
         args.update(body_fields)
 
-    req["params"]["arguments"] = args
-    logger.info("Translated tools/call args for %s: %s", tool_name, args)
+    req["params"][args_key] = args
+    logger.info("Translated tools/call args for %s via key=%s: %s", tool_name, args_key, args)
     return json.dumps(req).encode()
 
 
@@ -233,7 +236,17 @@ async def mcp_post(request: Request) -> Response:
 
     # Detect JSON-RPC method for response-side transforms
     try:
-        rpc_method = json.loads(body).get("method", "")
+        parsed = json.loads(body)
+        rpc_method = parsed.get("method", "")
+        if rpc_method == "tools/call":
+            # Log exact structure so we can verify the transform path
+            params = parsed.get("params") or {}
+            logger.info(
+                "tools/call structure — params keys=%s name=%s args_keys=%s",
+                list(params.keys()),
+                params.get("name"),
+                list((params.get("arguments") or params.get("input") or {}).keys()),
+            )
     except (json.JSONDecodeError, AttributeError):
         rpc_method = ""
 
