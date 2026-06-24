@@ -50,44 +50,67 @@ def _kebab_to_camel(name: str) -> str:
 
 def _transform_tools_list(response: dict) -> dict:
     """
-    Pega cannot handle hyphenated JSON property names (treats '-' as minus).
-    Rename kebab-case param names → camelCase in the tools/list schema so
-    Pega creates valid intent parameters. Store the reverse mapping so we
-    can convert back when forwarding tools/call to Salesforce.
+    Two transformations applied to every tool schema before sending to Pega:
+
+    1. kebab-case → camelCase rename
+       Pega treats hyphens as minus operators, so param names like 'sobject-name'
+       break intent generation. We rename them to camelCase and store a reverse
+       map so tools/call can convert back before forwarding to Salesforce.
+
+    2. Remove 'body' parameter, set additionalProperties=true
+       Salesforce MCP server treats every argument except the object-name param
+       as a direct SObject field value (FirstName, LastName, Email, …). When
+       'body' appears in the schema, Pega's LLM wraps fields inside it and
+       Salesforce then sees 'body' as a column name → "No such column 'body'".
+       Removing 'body' from the schema causes the LLM to pass field values
+       directly at the top level, matching what Salesforce actually expects.
     """
     tools = response.get("result", {}).get("tools", [])
     for tool in tools:
         tool_name = tool.get("name", "")
         schema = tool.get("inputSchema", {})
         props = schema.get("properties", {})
-        if not any("-" in k for k in props):
-            continue
-        new_props: dict = {}
-        _param_map[tool_name] = {}
-        for k, v in props.items():
-            new_k = _kebab_to_camel(k) if "-" in k else k
-            if new_k != k:
-                _param_map[tool_name][new_k] = k
-            new_props[new_k] = v
-        schema["properties"] = new_props
-        if "required" in schema:
-            schema["required"] = [
-                _kebab_to_camel(r) if "-" in r else r for r in schema["required"]
-            ]
-        logger.info("Remapped params for tool %s: %s", tool_name, _param_map.get(tool_name))
+
+        # Step 1: rename kebab-case params → camelCase for Pega compatibility
+        if any("-" in k for k in props):
+            new_props: dict = {}
+            _param_map[tool_name] = {}
+            for k, v in props.items():
+                new_k = _kebab_to_camel(k) if "-" in k else k
+                if new_k != k:
+                    _param_map[tool_name][new_k] = k
+                new_props[new_k] = v
+            schema["properties"] = new_props
+            props = new_props  # keep local ref in sync
+            if "required" in schema:
+                schema["required"] = [
+                    _kebab_to_camel(r) if "-" in r else r for r in schema["required"]
+                ]
+            logger.info("Remapped params for tool %s: %s", tool_name, _param_map.get(tool_name))
+
+        # Step 2: remove 'body' so LLM passes SObject fields at the top level
+        if "body" in props:
+            del props["body"]
+            schema["properties"] = props
+            schema["additionalProperties"] = True
+            req_list = schema.get("required", [])
+            if "body" in req_list:
+                schema["required"] = [r for r in req_list if r != "body"]
+            tool["description"] = (
+                tool.get("description", "").rstrip()
+                + " Pass SObject field values as direct arguments alongside"
+                " sobjectName (e.g. FirstName, LastName, Email, Department,"
+                " Phone, AccountId)."
+            )
+            logger.info("Removed 'body' from schema for tool %s", tool_name)
     return response
 
 
 def _transform_tools_call(raw: bytes) -> bytes:
     """
     Before forwarding tools/call to Salesforce:
-    1. Reverse camelCase→kebab for params that were renamed in tools/list
-       (e.g. sobjectName → sobject-name).
-    2. Flatten the 'body' dict to the top level. Salesforce MCP server treats
-       every argument except 'sobject-name' as a direct Salesforce field value.
-       When the LLM nests fields under 'body', the server sees 'body' as a
-       column name and fails. Claude.ai passes fields at the top level — we do
-       the same by lifting body's contents up.
+    1. Reverse camelCase→kebab for params renamed in tools/list (sobjectName → sobject-name).
+    2. Flatten any 'body' dict to the top level (safety net for cached old schemas).
     """
     try:
         req = json.loads(raw)
@@ -100,20 +123,22 @@ def _transform_tools_call(raw: bytes) -> bytes:
         tool_name = params.get("name", "")
         mapping = _param_map.get(tool_name, {})
         args_key = "arguments" if "arguments" in params else "input"
-        # Copy so we don't mutate the original
         args: dict = dict(params.get(args_key) or {})
 
-        # Step 1: reverse renamed params (sobjectName → sobject-name, etc.)
+        logger.info("tools/call %s raw args: %s", tool_name, list(args.keys()))
+
+        # Step 1: reverse camelCase → kebab-case (e.g. sobjectName → sobject-name)
         args = {mapping.get(k, k): v for k, v in args.items()}
 
-        # Step 2: flatten 'body' object to top-level fields
+        # Step 2: safety net — flatten any leftover 'body' dict to top level
         body_val = args.get("body")
         if isinstance(body_val, dict):
             del args["body"]
             args.update(body_val)
+            logger.info("tools/call %s flattened 'body' key", tool_name)
 
         req["params"][args_key] = args
-        logger.info("tools/call %s args after transform: %s", tool_name, list(args.keys()))
+        logger.info("tools/call %s final args: %s", tool_name, list(args.keys()))
         return json.dumps(req).encode()
     except Exception as exc:
         logger.error("_transform_tools_call failed (%s), forwarding original body", exc)

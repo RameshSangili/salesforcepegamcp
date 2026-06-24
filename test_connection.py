@@ -120,7 +120,16 @@ async def main() -> None:
             print("\nNo tools returned.")
             return
 
-        print(f"\nAvailable tools: {[t['name'] for t in tools]}")
+        print(f"\nAvailable tools ({len(tools)} total):")
+        for t in tools:
+            print(f"\n  Tool: {t['name']}")
+            print(f"  Description: {t.get('description', '')[:120]}")
+            schema = t.get("inputSchema", {})
+            props = schema.get("properties", {})
+            required = schema.get("required", [])
+            for prop_name, prop_def in props.items():
+                req = " (required)" if prop_name in required else " (optional)"
+                print(f"    param: {prop_name}{req} — {prop_def.get('type','?')} — {prop_def.get('description','')[:80]}")
 
         # Step 4: call soqlQuery to fetch Accounts
         print("\nStep 3 — calling soqlQuery: SELECT Id, Name, Type, Industry FROM Account LIMIT 10")
