@@ -78,39 +78,46 @@ def _transform_tools_list(response: dict) -> dict:
     return response
 
 
-def _transform_tools_call(body: bytes) -> bytes:
+def _transform_tools_call(raw: bytes) -> bytes:
     """
-    Two transforms before forwarding tools/call to Salesforce:
-    1. Reverse camelCase→kebab rename (undoes what _transform_tools_list did).
-    2. Flatten 'body' argument: Salesforce MCP server expects record fields as
-       direct top-level arguments alongside 'sobject-name', not nested under a
-       'body' key (it treats every argument except 'sobject-name' as a record
-       field, so {'body': {'Email': 'x'}} would try to set a 'body' column).
+    Before forwarding tools/call to Salesforce:
+    1. Reverse camelCase→kebab for params that were renamed in tools/list
+       (e.g. sobjectName → sobject-name).
+    2. Flatten the 'body' dict to the top level. Salesforce MCP server treats
+       every argument except 'sobject-name' as a direct Salesforce field value.
+       When the LLM nests fields under 'body', the server sees 'body' as a
+       column name and fails. Claude.ai passes fields at the top level — we do
+       the same by lifting body's contents up.
     """
     try:
-        req = json.loads(body)
-    except json.JSONDecodeError:
-        return body
+        req = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return raw
     if req.get("method") != "tools/call":
-        return body
-    params = req.get("params") or {}
-    tool_name = params.get("name", "")
-    mapping = _param_map.get(tool_name, {})
-    # MCP spec uses "arguments"; some clients use "input"
-    args_key = "arguments" if "arguments" in params else "input"
-    args: dict = params.get(args_key) or {}
+        return raw
+    try:
+        params = req.get("params") or {}
+        tool_name = params.get("name", "")
+        mapping = _param_map.get(tool_name, {})
+        args_key = "arguments" if "arguments" in params else "input"
+        # Copy so we don't mutate the original
+        args: dict = dict(params.get(args_key) or {})
 
-    # Step 1: reverse camelCase → original kebab-case
-    args = {mapping.get(k, k): v for k, v in args.items()}
+        # Step 1: reverse renamed params (sobjectName → sobject-name, etc.)
+        args = {mapping.get(k, k): v for k, v in args.items()}
 
-    # Step 2: flatten nested 'body' dict into top-level arguments
-    if "body" in args and isinstance(args["body"], dict):
-        body_fields = args.pop("body")
-        args.update(body_fields)
+        # Step 2: flatten 'body' object to top-level fields
+        body_val = args.get("body")
+        if isinstance(body_val, dict):
+            del args["body"]
+            args.update(body_val)
 
-    req["params"][args_key] = args
-    logger.info("Translated tools/call args for %s via key=%s: %s", tool_name, args_key, args)
-    return json.dumps(req).encode()
+        req["params"][args_key] = args
+        logger.info("tools/call %s args after transform: %s", tool_name, list(args.keys()))
+        return json.dumps(req).encode()
+    except Exception as exc:
+        logger.error("_transform_tools_call failed (%s), forwarding original body", exc)
+        return raw
 
 
 @asynccontextmanager
@@ -239,13 +246,12 @@ async def mcp_post(request: Request) -> Response:
         parsed = json.loads(body)
         rpc_method = parsed.get("method", "")
         if rpc_method == "tools/call":
-            # Log exact structure so we can verify the transform path
             params = parsed.get("params") or {}
+            raw_args = params.get("arguments") or params.get("input") or {}
             logger.info(
-                "tools/call structure — params keys=%s name=%s args_keys=%s",
-                list(params.keys()),
+                "tools/call name=%s args_keys=%s",
                 params.get("name"),
-                list((params.get("arguments") or params.get("input") or {}).keys()),
+                list(raw_args.keys()),
             )
     except (json.JSONDecodeError, AttributeError):
         rpc_method = ""
